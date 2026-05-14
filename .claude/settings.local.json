@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(g++ src/main.cpp src/glad.c -Iinclude -Llib -lglfw3 -lopengl32 -lgdi32 -std=c++17 -O2 -o programa.exe)"
+    ]
+  }
+}

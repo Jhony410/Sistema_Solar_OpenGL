@@ -1,432 +1,737 @@
+// ============================================================
+//  Sistema Solar 3D  -  OpenGL 3.3 Core Profile
+//  Computacion Grafica  -  2026-I
+// ============================================================
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
-#include <glm/gtc/type_ptr.hpp>
 
-#include <fstream>
-#include <sstream>
 #include <iostream>
 #include <vector>
 #include <string>
-#include <array>
 #include <cmath>
+#include <random>
+#include <algorithm>
+#include <sstream>
+#include <iomanip>
 
-// ---- Constantes de ventana ----
-const unsigned int SCR_WIDTH  = 800;
-const unsigned int SCR_HEIGHT = 600;
+#include "Shader.h"
+#include "Camera.h"
+#include "Sphere.h"
+#include "Planet.h"
 
-// ---- Camara orbital ----
-float radius   = 400.0f;
-float camYaw   = 45.0f;
-float camPitch = 40.0f;
+// ============================================================
+// CONSTANTES DE ESCENA
+// ============================================================
+static const int   SCR_W      = 1280;
+static const int   SCR_H      = 720;
+static const int   ORBIT_SEG  = 180;   // segmentos por linea de orbita
+static const int   NUM_STARS  = 4000;  // estrellas del fondo espacial
+static const float PI         = 3.14159265358979f;
 
-float lastX = SCR_WIDTH  / 2.0f;
-float lastY = SCR_HEIGHT / 2.0f;
-bool  firstMouse = true;
+// ============================================================
+// ESTADO GLOBAL (input / tiempo)
+// ============================================================
+Camera camera;
+float  lastX        = SCR_W * 0.5f;
+float  lastY        = SCR_H * 0.5f;
+bool   firstMouse   = true;
+float  deltaTime    = 0.0f;
+float  lastFrame    = 0.0f;
+float  simTime      = 0.0f;   // tiempo de simulacion acumulado
+float  timeScale    = 1.0f;   // 1.0 = velocidad normal
+bool   paused       = false;
+bool   showOrbits   = true;
 
-// ---- Rotacion del modelo ----
-float modelRotY = 0.0f;
+// Deteccion de flanco para teclas de toggle
+bool kO_prev = false, kP_prev = false;
+bool kPlus_prev = false, kMinus_prev = false;
+bool kR_prev = false, kL_prev = false;
+bool flashlight = false;   // destello de emergencia (tecla L)
 
-// ---- Wireframe ----
-bool wireframe    = false;
-bool fKeyPrevious = false;
-
-// ---- Tiempo ----
-float deltaTime = 0.0f;
-float lastFrame = 0.0f;
-
-// ================================================================
-// SHADERS
-// ================================================================
-std::string cargarFuenteShader(const char* ruta) {
-    std::ifstream archivo(ruta);
-    if (!archivo.is_open()) {
-        std::cerr << "ERROR: no se pudo abrir " << ruta << "\n";
-        return "";
-    }
-    std::ostringstream ss;
-    ss << archivo.rdbuf();
-    return ss.str();
+// ============================================================
+// HELPERS MATEMATICOS
+// ============================================================
+inline float smoothstepf(float e0, float e1, float x) {
+    float t = std::max(0.0f, std::min((x - e0) / (e1 - e0), 1.0f));
+    return t * t * (3.0f - 2.0f * t);
 }
 
-unsigned int crearProgramaShader(const char* rutaVertex, const char* rutaFragment) {
-    std::string vSrc = cargarFuenteShader(rutaVertex);
-    std::string fSrc = cargarFuenteShader(rutaFragment);
-    const char* vCode = vSrc.c_str();
-    const char* fCode = fSrc.c_str();
-
-    int  ok;
-    char log[512];
-
-    unsigned int vert = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vert, 1, &vCode, nullptr);
-    glCompileShader(vert);
-    glGetShaderiv(vert, GL_COMPILE_STATUS, &ok);
-    if (!ok) { glGetShaderInfoLog(vert, 512, nullptr, log); std::cerr << "ERROR vertex:\n" << log << "\n"; }
-
-    unsigned int frag = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(frag, 1, &fCode, nullptr);
-    glCompileShader(frag);
-    glGetShaderiv(frag, GL_COMPILE_STATUS, &ok);
-    if (!ok) { glGetShaderInfoLog(frag, 512, nullptr, log); std::cerr << "ERROR fragment:\n" << log << "\n"; }
-
-    unsigned int prog = glCreateProgram();
-    glAttachShader(prog, vert);
-    glAttachShader(prog, frag);
-    glLinkProgram(prog);
-    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-    if (!ok) { glGetProgramInfoLog(prog, 512, nullptr, log); std::cerr << "ERROR link:\n" << log << "\n"; }
-
-    glDeleteShader(vert);
-    glDeleteShader(frag);
-    return prog;
-}
-
-// ================================================================
-// CARGADOR OBJ
-// ================================================================
-struct VertCara {
-    int posIdx; // 0-based
-    int uvIdx;  // 0-based, -1 si ausente
-};
-
-// Parsea un token de cara: "123", "123/456", "123/456/789", "123//789"
-VertCara parsearVertCara(const std::string& tok) {
-    VertCara vc{ -1, -1 };
-    size_t s1 = tok.find('/');
-    if (s1 == std::string::npos) {
-        vc.posIdx = std::stoi(tok) - 1;
-    } else {
-        vc.posIdx = std::stoi(tok.substr(0, s1)) - 1;
-        size_t s2 = tok.find('/', s1 + 1);
-        std::string uvStr = (s2 == std::string::npos)
-            ? tok.substr(s1 + 1)
-            : tok.substr(s1 + 1, s2 - s1 - 1);
-        if (!uvStr.empty())
-            vc.uvIdx = std::stoi(uvStr) - 1;
-    }
-    return vc;
-}
-
-// Devuelve vector de floats intercalados: posicion(3) + normal(3) por cada vertice
-std::vector<float> cargarOBJ(const char* ruta, int& outNumTriangulos, float& outTileW, float& outTileD) {
-    std::ifstream archivo(ruta);
-    if (!archivo.is_open()) {
-        std::cerr << "ERROR: no se pudo abrir " << ruta << "\n";
-        return {};
-    }
-
-    std::vector<glm::vec3> tempPos;
-    std::vector<glm::vec2> tempUV;
-
-    // Cada triangulo: 3 VertCara
-    std::vector<std::array<VertCara, 3>> triangulos;
-
-    // Indices globales de inicio del objeto de terreno
-    // El OBJ puede tener objetos extra (ej. "Sphere" = cupula de cielo)
-    // Solo cargamos objetos que NO sean "Sphere"
-    bool objetoActivo = true; // si no hay linea "o", cargamos todo
-    int  offsetPos    = 0;    // vertices acumulados antes del objeto actual
-    int  posInicioObj = 0;    // cuantos verts tenia tempPos al entrar al objeto
-
-    std::string linea;
-    while (std::getline(archivo, linea)) {
-        if (linea.empty() || linea[0] == '#') continue;
-        std::istringstream iss(linea);
-        std::string prefijo;
-        iss >> prefijo;
-
-        if (prefijo == "o") {
-            // Nuevo objeto: actualizamos offset y decidimos si procesarlo
-            offsetPos    = (int)tempPos.size();
-            posInicioObj = offsetPos;
-            std::string nombreObj;
-            iss >> nombreObj;
-            // Saltar la cupula de cielo
-            objetoActivo = (nombreObj != "Sphere");
-            if (objetoActivo)
-                std::cout << "Cargando objeto: " << nombreObj << "\n";
-            else
-                std::cout << "Saltando objeto : " << nombreObj << "\n";
-
-        } else if (prefijo == "v") {
-            float x, y, z;
-            iss >> x >> y >> z;
-            // Siempre acumulamos posiciones para mantener los indices globales correctos
-            tempPos.push_back({ x, y, z });
-
-        } else if (prefijo == "vt") {
-            float u, v;
-            iss >> u >> v;
-            tempUV.push_back({ u, v });
-
-        } else if (prefijo == "f" && objetoActivo) {
-            // Solo triangulamos caras del objeto activo
-            std::vector<VertCara> caraVerts;
-            std::string tok;
-            while (iss >> tok)
-                caraVerts.push_back(parsearVertCara(tok));
-
-            // Fan triangulation: (0,1,2), (0,2,3), ...
-            for (size_t i = 1; i + 1 < caraVerts.size(); ++i) {
-                std::array<VertCara, 3> tri = { caraVerts[0], caraVerts[i], caraVerts[i + 1] };
-                triangulos.push_back(tri);
-            }
-        }
-    }
-
-    // ------ Centrar el terreno en el origen (bounding box solo de vertices usados) ------
-    // tempPos contiene vertices de TODOS los objetos (incluido Sphere), por eso se
-    // mide solo sobre los vertices que realmente referencian los triangulos del terreno
-    glm::vec3 bMin( 1e9f), bMax(-1e9f);
-    for (auto& tri : triangulos) {
-        for (auto& vc : tri) {
-            glm::vec3 p = tempPos[vc.posIdx];
-            bMin = glm::min(bMin, p);
-            bMax = glm::max(bMax, p);
-        }
-    }
-    outTileW = bMax.x - bMin.x;
-    outTileD = bMax.z - bMin.z;
-    glm::vec3 centro = (bMin + bMax) * 0.5f;
-    for (auto& p : tempPos) {
-        p -= centro;
-    }
-
-    // ------ Calcular normales por vertice (acumulacion de normales de cara) ------
-    // Se usa la normal de cara ponderada por area (sin normalizar el cross product)
-    // para que caras grandes aporten mas peso → smooth shading de mayor calidad
-    std::vector<glm::vec3> normalAcum(tempPos.size(), glm::vec3(0.0f));
-
-    for (auto& tri : triangulos) {
-        glm::vec3 p0 = tempPos[tri[0].posIdx];
-        glm::vec3 p1 = tempPos[tri[1].posIdx];
-        glm::vec3 p2 = tempPos[tri[2].posIdx];
-        glm::vec3 fn = glm::cross(p1 - p0, p2 - p0); // ponderado por area
-        normalAcum[tri[0].posIdx] += fn;
-        normalAcum[tri[1].posIdx] += fn;
-        normalAcum[tri[2].posIdx] += fn;
-    }
-    for (auto& n : normalAcum)
-        if (glm::length(n) > 1e-6f) n = glm::normalize(n);
-
-    // ------ Construir buffer intercalado (pos + normal) ------
-    std::vector<float> verts;
-    verts.reserve(triangulos.size() * 3 * 6);
-
-    for (auto& tri : triangulos) {
-        for (auto& vc : tri) {
-            glm::vec3 p = tempPos[vc.posIdx];
-            glm::vec3 n = normalAcum[vc.posIdx];
-            verts.push_back(p.x); verts.push_back(p.y); verts.push_back(p.z);
-            verts.push_back(n.x); verts.push_back(n.y); verts.push_back(n.z);
-        }
-    }
-
-    outNumTriangulos = (int)triangulos.size();
-    std::cout << "Vertices cargados : " << tempPos.size() << "\n";
-    std::cout << "Triangulos        : " << outNumTriangulos << "\n";
-    return verts;
-}
-
-// ================================================================
+// ============================================================
 // CALLBACKS
-// ================================================================
+// ============================================================
 void framebuffer_size_callback(GLFWwindow*, int w, int h) {
     glViewport(0, 0, w, h);
 }
 
-void mouse_callback(GLFWwindow*, double xposIn, double yposIn) {
-    float xpos = static_cast<float>(xposIn);
-    float ypos = static_cast<float>(yposIn);
-
-    if (firstMouse) { lastX = xpos; lastY = ypos; firstMouse = false; }
-
-    float xoff = (xpos - lastX) * 0.2f;
-    float yoff = (lastY - ypos) * 0.2f;
-    lastX = xpos; lastY = ypos;
-
-    camYaw   += xoff;
-    camPitch += yoff;
-    if (camPitch >  89.0f) camPitch =  89.0f;
-    if (camPitch < -89.0f) camPitch = -89.0f;
+void mouse_callback(GLFWwindow*, double xpos, double ypos) {
+    if (firstMouse) { lastX = (float)xpos; lastY = (float)ypos; firstMouse = false; return; }
+    float dx =  (float)(xpos - lastX);
+    float dy = -(float)(ypos - lastY);   // invertido: pantalla Y baja, camara sube
+    lastX = (float)xpos;
+    lastY = (float)ypos;
+    camera.processMouse(dx, dy);
 }
 
-void scroll_callback(GLFWwindow*, double, double yoffset) {
-    radius -= (float)yoffset * 10.0f;
-    if (radius <   5.0f) radius =   5.0f;
-    if (radius > 800.0f) radius = 800.0f;
+void scroll_callback(GLFWwindow*, double, double y) {
+    camera.processScroll((float)y);
 }
 
-// ================================================================
-// ENTRADA DE TECLADO
-// ================================================================
-void procesarEntrada(GLFWwindow* window) {
-    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-        glfwSetWindowShouldClose(window, true);
+// ============================================================
+// CARGA DE TEXTURA DESDE ARCHIVO
+// ============================================================
+unsigned int loadTexture(const std::string& path) {
+    unsigned int id;
+    glGenTextures(1, &id);
 
-    // W/S → zoom (radio)
-    float speed = 120.0f * deltaTime;
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) radius -= speed;
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) radius += speed;
-    if (radius <   5.0f) radius =   5.0f;
-    if (radius > 800.0f) radius = 800.0f;
+    int w, h, ch;
+    stbi_set_flip_vertically_on_load(true);
+    unsigned char* data = stbi_load(path.c_str(), &w, &h, &ch, 0);
 
-    // A/D → rotacion del modelo en Y
-    float rotSpeed = 90.0f * deltaTime;
-    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) modelRotY += rotSpeed;
-    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) modelRotY -= rotSpeed;
+    if (data) {
+        GLenum fmt = (ch == 4) ? GL_RGBA : (ch == 3 ? GL_RGB : GL_RED);
+        glBindTexture(GL_TEXTURE_2D, id);
+        glTexImage2D(GL_TEXTURE_2D, 0, fmt, w, h, 0, fmt, GL_UNSIGNED_BYTE, data);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,  GL_LINEAR);
+        stbi_image_free(data);
+        std::cout << "[Textura] OK : " << path
+                  << "  (" << w << "x" << h << " ch=" << ch << ")\n";
+    } else {
+        std::cerr << "[Textura] ERR: " << path << "\n";
+        unsigned char pix[] = {100, 100, 160, 255};
+        glBindTexture(GL_TEXTURE_2D, id);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+    }
 
-    // F → toggle wireframe (deteccion de flanco)
-    bool fKeyNow = (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS);
-    if (fKeyNow && !fKeyPrevious) {
-        wireframe = !wireframe;
-        if (wireframe) {
-            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-            std::cout << "Wireframe: ON\n";
-        } else {
-            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-            std::cout << "Wireframe: OFF\n";
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return id;
+}
+
+// ============================================================
+// TEXTURA PROCEDURAL DE LOS ANILLOS DE SATURNO
+// Genera una franja horizontal con bandas de color y opacidad
+// similares a los anillos reales (D, C, B, Cassini, A, F)
+// ============================================================
+unsigned int generateRingTexture() {
+    const int W = 512, H = 4;
+    std::vector<unsigned char> px(W * H * 4, 0);
+
+    std::mt19937 rng(7777);
+    std::uniform_real_distribution<float> jitter(-0.03f, 0.03f);
+
+    for (int x = 0; x < W; ++x) {
+        float t = (float)x / (W - 1);   // 0 = borde interior, 1 = borde exterior
+
+        float r, g, b, a;
+        r = 0.88f; g = 0.80f; b = 0.64f; a = 0.0f;
+
+        if      (t < 0.05f)           { a = t/0.05f * 0.20f; r=0.70f; g=0.65f; b=0.55f; }
+        else if (t < 0.06f)           { a = smoothstepf(0.05f,0.06f,t) * 0.20f; }
+        // Anillo C
+        else if (t < 0.22f)           { a = 0.38f; r=0.72f; g=0.67f; b=0.58f; }
+        else if (t < 0.235f)          { a = 0.05f; }        // hueco Maxwell
+        // Anillo B (el mas denso y brillante)
+        else if (t < 0.44f)           { a = 0.92f; r=0.96f; g=0.89f; b=0.72f; }
+        else if (t < 0.455f)          { a = 0.70f; r=0.90f; g=0.84f; b=0.68f; }
+        // Division de Cassini
+        else if (t < 0.52f) {
+            float f = (t - 0.44f) / (0.52f - 0.44f);
+            a = (1.0f - smoothstepf(0.0f, 1.0f, f)) * 0.88f;
+            if (a < 0.04f) a = 0.04f;
+        }
+        // Anillo A
+        else if (t < 0.70f)           { a = 0.78f; r=0.93f; g=0.86f; b=0.70f; }
+        // Hueco de Encke (delgado)
+        else if (t < 0.725f)          { a = 0.08f; }
+        else if (t < 0.80f)           { a = 0.68f; r=0.90f; g=0.83f; b=0.68f; }
+        // Anillo F (tenue y angosto)
+        else if (t < 0.84f)           { a = 0.28f; r=0.80f; g=0.74f; b=0.62f; }
+        // Borde exterior: desvanecimiento
+        else { a = smoothstepf(1.0f, 0.84f, t) * 0.18f; }
+
+        // Variacion aleatoria de densidad para que no sea tan uniforme
+        a = std::max(0.0f, std::min(1.0f, a + jitter(rng)));
+
+        for (int y = 0; y < H; ++y) {
+            int idx = (y * W + x) * 4;
+            px[idx+0] = (unsigned char)(r * 255);
+            px[idx+1] = (unsigned char)(g * 255);
+            px[idx+2] = (unsigned char)(b * 255);
+            px[idx+3] = (unsigned char)(a * 255);
         }
     }
-    fKeyPrevious = fKeyNow;
+
+    unsigned int tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,  GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return tex;
 }
 
-// ================================================================
+// ============================================================
+// VAO DE LINEA DE ORBITA  (circulo centrado en el origen)
+// En el shader se suma uCenter para trasladar al padre correcto
+// ============================================================
+GLuint createOrbitVAO(float radius) {
+    std::vector<float> v;
+    v.reserve(ORBIT_SEG * 3);
+    for (int i = 0; i < ORBIT_SEG; ++i) {
+        float a = 2.0f * PI * i / ORBIT_SEG;
+        v.push_back(radius * cosf(a));
+        v.push_back(0.0f);
+        v.push_back(radius * sinf(a));
+    }
+    GLuint vao, vbo;
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(v.size()*sizeof(float)),
+        v.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3*sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+    return vao;
+}
+
+// ============================================================
+// GEOMETRIA DEL ANILLO DE SATURNO
+// ============================================================
+struct RingMesh {
+    GLuint vao, vbo, ebo;
+    int    indexCount;
+};
+
+RingMesh createRingMesh(float inner, float outer, int segs = 160) {
+    std::vector<float>        verts;
+    std::vector<unsigned int> inds;
+
+    for (int i = 0; i <= segs; ++i) {
+        float a = 2.0f * PI * i / segs;
+        float c = cosf(a), s = sinf(a);
+        float u = (float)i / segs;
+
+        verts.insert(verts.end(), {inner*c, 0.f, inner*s,  0.f,1.f,0.f,  u, 0.f});
+        verts.insert(verts.end(), {outer*c, 0.f, outer*s,  0.f,1.f,0.f,  u, 1.f});
+    }
+
+    for (int i = 0; i < segs; ++i) {
+        unsigned int b = i * 2;
+        inds.push_back(b);   inds.push_back(b+1); inds.push_back(b+2);
+        inds.push_back(b+2); inds.push_back(b+1); inds.push_back(b+3);
+    }
+
+    GLuint vao, vbo, ebo;
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glGenBuffers(1, &ebo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(verts.size()*sizeof(float)),
+        verts.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(inds.size()*sizeof(unsigned int)),
+        inds.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,8*sizeof(float),(void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,8*sizeof(float),(void*)(3*sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2,2,GL_FLOAT,GL_FALSE,8*sizeof(float),(void*)(6*sizeof(float)));
+    glEnableVertexAttribArray(2);
+    glBindVertexArray(0);
+
+    return {vao, vbo, ebo, (int)inds.size()};
+}
+
+// ============================================================
+// CAMPO DE ESTRELLAS  (puntos aleatorios en esfera grande)
+// ============================================================
+GLuint createStarsVAO() {
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> d01(0.0f, 1.0f);
+
+    std::vector<float> v;
+    v.reserve(NUM_STARS * 4);
+
+    for (int i = 0; i < NUM_STARS; ++i) {
+        float theta = 2.0f * PI * d01(rng);
+        float phi   = acosf(2.0f * d01(rng) - 1.0f);
+        float R     = 2600.0f;
+
+        v.push_back(R * sinf(phi) * cosf(theta));
+        v.push_back(R * cosf(phi));
+        v.push_back(R * sinf(phi) * sinf(theta));
+        v.push_back(d01(rng) * 0.7f + 0.3f);   // brillo 0.3..1.0
+    }
+
+    GLuint vao, vbo;
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(v.size()*sizeof(float)),
+        v.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,4*sizeof(float),(void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1,1,GL_FLOAT,GL_FALSE,4*sizeof(float),(void*)(3*sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
+    return vao;
+}
+
+// ============================================================
+// PROCESAR ENTRADA DE TECLADO
+// ============================================================
+void processInput(GLFWwindow* win) {
+    if (glfwGetKey(win, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+        glfwSetWindowShouldClose(win, true);
+
+    // Movimiento de camara (WASD + EQ para subir/bajar)
+    if (glfwGetKey(win, GLFW_KEY_W) == GLFW_PRESS) camera.moveForward (deltaTime);
+    if (glfwGetKey(win, GLFW_KEY_S) == GLFW_PRESS) camera.moveBackward(deltaTime);
+    if (glfwGetKey(win, GLFW_KEY_A) == GLFW_PRESS) camera.moveLeft    (deltaTime);
+    if (glfwGetKey(win, GLFW_KEY_D) == GLFW_PRESS) camera.moveRight   (deltaTime);
+    if (glfwGetKey(win, GLFW_KEY_E) == GLFW_PRESS) camera.moveUp      (deltaTime);
+    if (glfwGetKey(win, GLFW_KEY_Q) == GLFW_PRESS) camera.moveDown    (deltaTime);
+
+    // Toggle orbitas (O) - flanco de subida
+    bool kO = (glfwGetKey(win, GLFW_KEY_O) == GLFW_PRESS);
+    if (kO && !kO_prev) showOrbits = !showOrbits;
+    kO_prev = kO;
+
+    // Pausa / Resume (P)
+    bool kP = (glfwGetKey(win, GLFW_KEY_P) == GLFW_PRESS);
+    if (kP && !kP_prev) {
+        paused = !paused;
+        std::cout << (paused ? "[Sim] PAUSADO\n" : "[Sim] REANUDADO\n");
+    }
+    kP_prev = kP;
+
+    // Acelerar simulacion (+)
+    bool kPlus = (glfwGetKey(win, GLFW_KEY_EQUAL) == GLFW_PRESS ||
+                  glfwGetKey(win, GLFW_KEY_KP_ADD) == GLFW_PRESS);
+    if (kPlus && !kPlus_prev) {
+        timeScale = std::min(timeScale * 2.0f, 64.0f);
+        std::cout << "[Sim] Velocidad x" << timeScale << "\n";
+    }
+    kPlus_prev = kPlus;
+
+    // Ralentizar simulacion (-)
+    bool kMinus = (glfwGetKey(win, GLFW_KEY_MINUS)    == GLFW_PRESS ||
+                   glfwGetKey(win, GLFW_KEY_KP_SUBTRACT) == GLFW_PRESS);
+    if (kMinus && !kMinus_prev) {
+        timeScale = std::max(timeScale * 0.5f, 0.0625f);
+        std::cout << "[Sim] Velocidad x" << timeScale << "\n";
+    }
+    kMinus_prev = kMinus;
+
+    // Resetear camara (R)
+    bool kR = (glfwGetKey(win, GLFW_KEY_R) == GLFW_PRESS);
+    if (kR && !kR_prev) camera.resetPosition();
+    kR_prev = kR;
+
+    // Destello de emergencia (L) - ilumina todo desde la camara
+    bool kL = (glfwGetKey(win, GLFW_KEY_L) == GLFW_PRESS);
+    if (kL && !kL_prev) {
+        flashlight = !flashlight;
+        std::cout << (flashlight ? "[Luz] Destello ON\n" : "[Luz] Destello OFF\n");
+    }
+    kL_prev = kL;
+}
+
+// ============================================================
 // MAIN
-// ================================================================
+// ============================================================
 int main() {
-    // -- Inicializar GLFW --
+    // ----------------------------------------------------------
+    // 1. INICIALIZACION DE GLFW Y OPENGL
+    // ----------------------------------------------------------
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_SAMPLES, 4);   // MSAA 4x
 
-    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT,
-        "Visor Terreno OBJ - SIS226", nullptr, nullptr);
-    if (!window) {
-        std::cerr << "ERROR: no se pudo crear la ventana GLFW\n";
+    GLFWwindow* win = glfwCreateWindow(SCR_W, SCR_H,
+        "Sistema Solar 3D  |  WASD=mover  Mouse=rotar  Scroll=velocidad  O=orbitas  P=pausa  R=reset",
+        nullptr, nullptr);
+    if (!win) {
+        std::cerr << "ERROR: no se pudo crear la ventana.\n";
         glfwTerminate();
         return -1;
     }
-    glfwMakeContextCurrent(window);
-    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
-    glfwSetCursorPosCallback(window,       mouse_callback);
-    glfwSetScrollCallback(window,          scroll_callback);
-    glfwSetInputMode(window, GLFW_CURSOR,  GLFW_CURSOR_DISABLED);
+    glfwMakeContextCurrent(win);
+    glfwSetFramebufferSizeCallback(win, framebuffer_size_callback);
+    glfwSetCursorPosCallback      (win, mouse_callback);
+    glfwSetScrollCallback         (win, scroll_callback);
+    glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
-    // -- Inicializar GLAD --
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-        std::cerr << "ERROR: no se pudo inicializar GLAD\n";
+        std::cerr << "ERROR: no se pudo inicializar GLAD.\n";
         return -1;
     }
+
     glEnable(GL_DEPTH_TEST);
+    glEnable(GL_MULTISAMPLE);
+    glEnable(GL_PROGRAM_POINT_SIZE);    // para gl_PointSize en el vertex shader
 
-    // -- Shaders --
-    unsigned int shaderProgram = crearProgramaShader("src/vertex.glsl", "src/fragment.glsl");
+    std::cout << "OpenGL " << glGetString(GL_VERSION) << "\n"
+              << "Renderer: " << glGetString(GL_RENDERER) << "\n\n";
 
-    // -- Cargar OBJ --
-    int   numTriangulos = 0;
-    float tileW = 64.0f, tileD = 64.0f;
-    std::vector<float> vertices = cargarOBJ("SnowTerrain.obj", numTriangulos, tileW, tileD);
-    if (vertices.empty()) {
-        std::cerr << "ERROR: no se pudieron cargar vertices del OBJ\n";
-        return -1;
-    }
-    int numVertices = (int)(vertices.size() / 6);
-    std::cout << "Tile size: " << tileW << " x " << tileD << " unidades\n";
+    // ----------------------------------------------------------
+    // 2. CARGA DE SHADERS
+    // ----------------------------------------------------------
+    Shader shPlanet ("shaders/planet.vert", "shaders/planet.frag");
+    Shader shSun    ("shaders/sun.vert",    "shaders/sun.frag");
+    Shader shOrbit  ("shaders/orbit.vert",  "shaders/orbit.frag");
+    Shader shRing   ("shaders/ring.vert",   "shaders/ring.frag");
+    Shader shStars  ("shaders/stars.vert",  "shaders/stars.frag");
 
-    // -- VAO / VBO --
-    unsigned int VAO, VBO;
-    glGenVertexArrays(1, &VAO);
-    glGenBuffers(1, &VBO);
+    // ----------------------------------------------------------
+    // 3. GEOMETRIA COMPARTIDA
+    // ----------------------------------------------------------
+    Sphere sphere(64, 64);     // todos los planetas usan la misma esfera
 
-    glBindVertexArray(VAO);
-    glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferData(GL_ARRAY_BUFFER,
-        (GLsizeiptr)(vertices.size() * sizeof(float)),
-        vertices.data(), GL_STATIC_DRAW);
+    RingMesh ring = createRingMesh(2.6f, 5.0f);   // anillos de Saturno
+    GLuint   ringTex  = generateRingTexture();
 
-    // Posicion (location 0) → primeros 3 floats del stride de 6
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE,
-        6 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
+    GLuint starsVAO = createStarsVAO();
 
-    // Normal (location 1) → floats 3-5 del stride de 6
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE,
-        6 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
+    // ----------------------------------------------------------
+    // 4. DEFINICION DE PLANETAS
+    // Escala visual (no astronomica) diseñada para apreciarse bien
+    //   radius     = radio visual del planeta
+    //   orbitRadius= distancia al padre
+    //   orbitSpeed = velocidad angular rad/s de simulacion
+    //   rotSpeed   = velocidad de rotacion propia rad/s
+    //   axialTilt  = inclinacion del eje en grados
+    // ----------------------------------------------------------
+    Planet sol, mercury, venus, earth, moon, mars, jupiter, saturn, uranus, neptune;
 
-    glBindVertexArray(0);
+    // Sol -------------------------------------------------------
+    sol.name          = "Sol";
+    sol.radius        = 5.0f;
+    sol.orbitRadius   = 0.0f;
+    sol.orbitSpeed    = 0.0f;
+    sol.rotationSpeed = 0.04f;
+    sol.axialTilt     = 7.25f;
+    sol.texture       = loadTexture("texturas/sol.jpg");
 
-    // ================================================================
-    // BUCLE PRINCIPAL
-    // ================================================================
-    while (!glfwWindowShouldClose(window)) {
-        float currentFrame = static_cast<float>(glfwGetTime());
-        deltaTime = currentFrame - lastFrame;
-        lastFrame = currentFrame;
+    // Mercurio --------------------------------------------------
+    mercury.name          = "Mercurio";
+    mercury.radius        = 0.35f;
+    mercury.orbitRadius   = 10.0f;
+    mercury.orbitSpeed    = 1.0f;
+    mercury.rotationSpeed = 0.018f;
+    mercury.axialTilt     = 0.03f;
+    mercury.texture       = loadTexture("texturas/mercurio.jpg");
 
-        procesarEntrada(window);
+    // Venus -----------------------------------------------------
+    venus.name          = "Venus";
+    venus.radius        = 0.87f;
+    venus.orbitRadius   = 17.0f;
+    venus.orbitSpeed    = 0.46f;
+    venus.rotationSpeed = -0.012f;    // rotacion retrograda
+    venus.axialTilt     = 177.4f;
+    venus.texture       = loadTexture("texturas/venus.jpg");
 
-        glClearColor(0.10f, 0.12f, 0.18f, 1.0f);
+    // Tierra ----------------------------------------------------
+    earth.name          = "Tierra";
+    earth.radius        = 0.92f;
+    earth.orbitRadius   = 25.0f;
+    earth.orbitSpeed    = 0.25f;
+    earth.rotationSpeed = 0.80f;
+    earth.axialTilt     = 23.5f;
+    earth.texture       = loadTexture("texturas/tierra.jpg");
+
+    // Luna (orbita la Tierra) -----------------------------------
+    moon.name          = "Luna";
+    moon.radius        = 0.25f;
+    moon.orbitRadius   = 3.2f;
+    moon.orbitSpeed    = 3.4f;        // 13.4x mas rapida que la Tierra
+    moon.rotationSpeed = 0.08f;       // rotacion lenta (casi bloqueada)
+    moon.axialTilt     = 6.68f;
+    moon.texture       = loadTexture("texturas/luna.jpg");
+    moon.parent        = &earth;      // orbita alrededor de la Tierra
+
+    // Marte -----------------------------------------------------
+    mars.name          = "Marte";
+    mars.radius        = 0.49f;
+    mars.orbitRadius   = 34.0f;
+    mars.orbitSpeed    = 0.153f;
+    mars.rotationSpeed = 0.77f;
+    mars.axialTilt     = 25.2f;
+    mars.texture       = loadTexture("texturas/marte.jpg");
+
+    // Jupiter ---------------------------------------------------
+    jupiter.name          = "Jupiter";
+    jupiter.radius        = 2.5f;
+    jupiter.orbitRadius   = 54.0f;
+    jupiter.orbitSpeed    = 0.058f;
+    jupiter.rotationSpeed = 2.0f;
+    jupiter.axialTilt     = 3.1f;
+    jupiter.texture       = loadTexture("texturas/jupiter.jpg");
+
+    // Saturno ---------------------------------------------------
+    saturn.name          = "Saturno";
+    saturn.radius        = 2.0f;
+    saturn.orbitRadius   = 76.0f;
+    saturn.orbitSpeed    = 0.034f;
+    saturn.rotationSpeed = 1.85f;
+    saturn.axialTilt     = 26.7f;
+    saturn.texture       = loadTexture("texturas/saturno.jpg");
+
+    // Urano -----------------------------------------------------
+    uranus.name          = "Urano";
+    uranus.radius        = 1.5f;
+    uranus.orbitRadius   = 97.0f;
+    uranus.orbitSpeed    = 0.023f;
+    uranus.rotationSpeed = -1.5f;     // rotacion retrograda
+    uranus.axialTilt     = 97.77f;    // eje casi horizontal
+    uranus.texture       = loadTexture("texturas/urano.jpg");
+
+    // Neptuno ---------------------------------------------------
+    neptune.name          = "Neptuno";
+    neptune.radius        = 1.4f;
+    neptune.orbitRadius   = 116.0f;
+    neptune.orbitSpeed    = 0.016f;
+    neptune.rotationSpeed = 1.6f;
+    neptune.axialTilt     = 28.3f;
+    neptune.texture       = loadTexture("texturas/nepturno.jpg");   // nombre real del archivo
+
+    // Lista de todos los cuerpos (excepto Sol) para iterar facilmente
+    std::vector<Planet*> bodies = {
+        &mercury, &venus, &earth, &moon,
+        &mars, &jupiter, &saturn, &uranus, &neptune
+    };
+
+    // ----------------------------------------------------------
+    // 5. LINEAS DE ORBITA
+    // OrbitInfo: VAO del circulo, y puntero al planeta padre (null = Sol)
+    // ----------------------------------------------------------
+    struct OrbitInfo { GLuint vao; Planet* center; };
+
+    std::vector<OrbitInfo> orbits = {
+        { createOrbitVAO(mercury.orbitRadius), nullptr    },
+        { createOrbitVAO(venus.orbitRadius),   nullptr    },
+        { createOrbitVAO(earth.orbitRadius),   nullptr    },
+        { createOrbitVAO(moon.orbitRadius),    &earth     },
+        { createOrbitVAO(mars.orbitRadius),    nullptr    },
+        { createOrbitVAO(jupiter.orbitRadius), nullptr    },
+        { createOrbitVAO(saturn.orbitRadius),  nullptr    },
+        { createOrbitVAO(uranus.orbitRadius),  nullptr    },
+        { createOrbitVAO(neptune.orbitRadius), nullptr    },
+    };
+
+    // ----------------------------------------------------------
+    // 6. ESTADO FPS (para titulo de ventana)
+    // ----------------------------------------------------------
+    double fpsTimer   = 0.0;
+    int    fpsFrames  = 0;
+    float  fpsDisplay = 0.0f;
+
+    // ----------------------------------------------------------
+    // 7. BUCLE PRINCIPAL
+    // ----------------------------------------------------------
+    while (!glfwWindowShouldClose(win)) {
+
+        // --- Tiempo ---
+        float now   = (float)glfwGetTime();
+        deltaTime   = now - lastFrame;
+        lastFrame   = now;
+
+        // --- Avanzar simulacion (se detiene con P, acelera con +/-) ---
+        float dt = paused ? 0.0f : deltaTime * timeScale;
+        simTime += dt;
+
+        for (Planet* p : bodies) p->update(dt);
+        sol.update(dt);
+
+        // --- FPS counter en titulo ---
+        fpsFrames++;
+        fpsTimer += deltaTime;
+        if (fpsTimer >= 0.5) {
+            fpsDisplay = fpsFrames / (float)fpsTimer;
+            fpsFrames  = 0;
+            fpsTimer   = 0.0;
+
+            std::ostringstream title;
+            title << "Sistema Solar 3D  |  "
+                  << std::fixed << std::setprecision(0) << fpsDisplay << " FPS"
+                  << "  |  x" << timeScale
+                  << (paused     ? "  [PAUSADO]"       : "")
+                  << (flashlight ? "  [DESTELLO ON]"   : "")
+                  << "  |  WASD+EQ=mover  O=orbitas  P=pausa  L=destello  R=reset  +/-=vel";
+            glfwSetWindowTitle(win, title.str().c_str());
+        }
+
+        // --- Input ---
+        processInput(win);
+
+        // --- Limpiar buffers ---
+        glClearColor(0.0f, 0.0f, 0.02f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // -- Posicion de camara (coordenadas esfericas) --
-        float yawRad   = glm::radians(camYaw);
-        float pitchRad = glm::radians(camPitch);
-        glm::vec3 camPos(
-            radius * cosf(pitchRad) * sinf(yawRad),
-            radius * sinf(pitchRad),
-            radius * cosf(pitchRad) * cosf(yawRad)
+        // --- Matrices de vista y proyeccion ---
+        glm::mat4 view = camera.getView();
+        glm::mat4 proj = glm::perspective(
+            glm::radians(camera.fov),
+            (float)SCR_W / SCR_H,
+            0.5f, 6000.0f
         );
 
-        // -- Luz orbital automatica (alta para iluminar todo el grid) --
-        glm::vec3 lightPos(
-            sinf(currentFrame * 0.3f) * 300.0f,
-            250.0f,
-            cosf(currentFrame * 0.3f) * 300.0f
-        );
+        // ===========================================================
+        // A. ESTRELLAS (primero, con escritura de profundidad apagada)
+        // ===========================================================
+        glDepthMask(GL_FALSE);
+        shStars.use();
+        shStars.set("view",       view);
+        shStars.set("projection", proj);
+        glBindVertexArray(starsVAO);
+        glDrawArrays(GL_POINTS, 0, NUM_STARS);
+        glBindVertexArray(0);
+        glDepthMask(GL_TRUE);
 
-        // -- Matrices --
-        glm::mat4 view  = glm::lookAt(camPos, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
-        glm::mat4 proj  = glm::perspective(glm::radians(45.0f),
-            (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.5f, 3000.0f);
+        // ===========================================================
+        // B. ORBITAS (lineas semitransparentes)
+        // ===========================================================
+        if (showOrbits) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-        // -- Uniforms constantes por frame --
-        glUseProgram(shaderProgram);
-        int locModel = glGetUniformLocation(shaderProgram, "model");
-        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"),       1, GL_FALSE, glm::value_ptr(view));
-        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
-        glUniform3fv(glGetUniformLocation(shaderProgram, "lightPos"),  1, glm::value_ptr(lightPos));
-        glUniform3fv(glGetUniformLocation(shaderProgram, "viewPos"),   1, glm::value_ptr(camPos));
-        glUniform3f(glGetUniformLocation(shaderProgram, "lightColor"),  1.0f, 1.0f, 1.0f);
-        glUniform3f(glGetUniformLocation(shaderProgram, "objectColor"), 0.85f, 0.90f, 0.95f);
+            shOrbit.use();
+            shOrbit.set("view",       view);
+            shOrbit.set("projection", proj);
+            shOrbit.set("uColor",     glm::vec4(0.55f, 0.65f, 0.85f, 0.25f));
 
-        // -- Dibujar grid 11x11 de tiles (5 en cada direccion) --
-        const int TILE_RANGE = 5;
-        glm::mat4 globalRot = glm::rotate(glm::mat4(1.0f),
-            glm::radians(modelRotY), glm::vec3(0.0f, 1.0f, 0.0f));
+            for (auto& o : orbits) {
+                glm::vec3 center = o.center ? o.center->worldPos() : glm::vec3(0.0f);
+                shOrbit.set("uCenter", center);
+                glBindVertexArray(o.vao);
+                glDrawArrays(GL_LINE_LOOP, 0, ORBIT_SEG);
+                glBindVertexArray(0);
+            }
 
-        glBindVertexArray(VAO);
-        for (int ix = -TILE_RANGE; ix <= TILE_RANGE; ++ix) {
-            for (int iz = -TILE_RANGE; iz <= TILE_RANGE; ++iz) {
-                glm::mat4 tileTrans = glm::translate(glm::mat4(1.0f),
-                    glm::vec3(ix * tileW, 0.0f, iz * tileD));
-                glm::mat4 tileModel = globalRot * tileTrans;
-                glUniformMatrix4fv(locModel, 1, GL_FALSE, glm::value_ptr(tileModel));
-                glDrawArrays(GL_TRIANGLES, 0, numVertices);
+            glDisable(GL_BLEND);
+        }
+
+        // ===========================================================
+        // C. SOL  (auto-iluminado, shader especial)
+        // ===========================================================
+        {
+            shSun.use();
+            shSun.set("view",       view);
+            shSun.set("projection", proj);
+            shSun.set("uTime",      now);
+
+            glm::mat4 sunModel = sol.modelMatrix();
+            shSun.set("model", sunModel);
+
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, sol.texture);
+            shSun.set("uTexture", 0);
+
+            sphere.draw();
+        }
+
+        // ===========================================================
+        // D. PLANETAS Y LUNA  (iluminacion Phong desde el Sol)
+        // ===========================================================
+        {
+            shPlanet.use();
+            shPlanet.set("view",         view);
+            shPlanet.set("projection",   proj);
+            shPlanet.set("uLightPos",      glm::vec3(0.0f));  // Sol en el origen
+            shPlanet.set("uViewPos",       camera.position);
+            shPlanet.set("uLightColor",    glm::vec3(1.0f, 0.95f, 0.82f));
+            shPlanet.set("uAmbient",       0.07f);
+            shPlanet.set("uSpecularStr",   0.25f);
+            shPlanet.set("uShininess",     24.0f);
+            shPlanet.set("uTexture",       0);
+            shPlanet.set("uFlashlight",    flashlight ? 1 : 0);
+            shPlanet.set("uFlashlightPos", camera.position);
+
+            for (Planet* p : bodies) {
+                glm::mat4 model  = p->modelMatrix();
+                glm::mat3 normal = glm::mat3(glm::transpose(glm::inverse(model)));
+
+                shPlanet.set("model",        model);
+                shPlanet.set("normalMatrix", normal);
+
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, p->texture);
+
+                sphere.draw();
             }
         }
 
-        glfwSwapBuffers(window);
+        // ===========================================================
+        // E. ANILLOS DE SATURNO  (semitransparentes, doble cara)
+        // ===========================================================
+        {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            // Desactivar culling para ver el anillo desde arriba y abajo
+            glDisable(GL_CULL_FACE);
+
+            shRing.use();
+            shRing.set("view",       view);
+            shRing.set("projection", proj);
+            shRing.set("uLightPos",  glm::vec3(0.0f));
+            shRing.set("uLightColor",glm::vec3(1.0f, 0.95f, 0.82f));
+            shRing.set("uAmbient",   0.18f);
+            shRing.set("uTexture",   0);
+
+            glm::mat4 ringModel(1.0f);
+            ringModel = glm::translate(ringModel, saturn.worldPos());
+            ringModel = glm::rotate(ringModel,
+                glm::radians(saturn.axialTilt), glm::vec3(0.0f, 0.0f, 1.0f));
+
+            glm::mat3 ringNorm = glm::mat3(glm::transpose(glm::inverse(ringModel)));
+
+            shRing.set("model",        ringModel);
+            shRing.set("normalMatrix", ringNorm);
+
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, ringTex);
+
+            glBindVertexArray(ring.vao);
+            glDrawElements(GL_TRIANGLES, ring.indexCount, GL_UNSIGNED_INT, nullptr);
+            glBindVertexArray(0);
+
+            glDisable(GL_BLEND);
+            // Restaurar culling de cara frontal (OpenGL no lo activa por defecto,
+            // pero es buena practica dejarlo consistente)
+        }
+
+        glfwSwapBuffers(win);
         glfwPollEvents();
     }
 
-    glDeleteVertexArrays(1, &VAO);
-    glDeleteBuffers(1, &VBO);
-    glDeleteProgram(shaderProgram);
+    // ----------------------------------------------------------
+    // 8. LIMPIEZA
+    // ----------------------------------------------------------
+    for (auto& o : orbits) glDeleteVertexArrays(1, &o.vao);
+    glDeleteVertexArrays(1, &starsVAO);
+    glDeleteVertexArrays(1, &ring.vao);
+    glDeleteBuffers(1, &ring.vbo);
+    glDeleteBuffers(1, &ring.ebo);
+    glDeleteTextures(1, &ringTex);
+
     glfwTerminate();
     return 0;
 }
